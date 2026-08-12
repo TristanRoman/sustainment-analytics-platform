@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "trained_at": "2026-08-12T02:17:46.112881+00:00",
+  "selected_model": "logistic_regression",
+  "data_window": {
+    "train_start": "2023-08-11 00:21:54",
+    "train_end": "2025-08-11 00:14:00",
+    "test_start": "2025-08-11 00:21:54",
+    "test_end": "2026-08-10 16:50:32"
+  },
+  "features": {
+    "categorical": [
+      "component_class",
+      "base_code",
+      "aircraft_tail",
+      "priority_code",
+      "month"
+    ],
+    "numeric": [
+      "component_age_hours",
+      "hours_since_overhaul",
+      "prior_event_count"
+    ]
+  },
+  "target": "exceeds_48h (opened_at to closed_at > 48 hours; still-open events excluded from training)",
+  "top_decile_capacity": 0.1,
+  "metrics": {
+    "logistic_regression": {
+      "pr_auc": 0.179202490190616,
+      "base_rate": 0.10191198786039454,
+      "operating_threshold": 0.7186089750346804,
+      "flagged_fraction": 0.10003034901365705,
+      "precision_at_threshold": 0.20813106796116504,
+      "recall_at_threshold": 0.20428826682549137
+    },
+    "gradient_boosting": {
+      "pr_auc": 0.16027080913783587,
+      "base_rate": 0.10191198786039454,
+      "operating_threshold": 0.6395995409817836,
+      "flagged_fraction": 0.10009104704097117,
+      "precision_at_threshold": 0.18617343844754397,
+      "recall_at_threshold": 0.18284693269803454
+    }
+  },
+  "n_train": 33337,
+  "n_test": 16475
+}
