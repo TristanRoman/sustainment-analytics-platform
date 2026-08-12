@@ -35,11 +35,15 @@ METADATA_PATH = APP_DIR / "models" / "metadata.json"
 
 # These hex values come from the dataviz skill's reference palette, because
 # it was already validated colorblind-safe in a fixed categorical order --
-# picking colors ad hoc here would risk an unvalidated, non-CVD-safe result
+# picking colors ad hoc here would risk an unvalidated, non-CVD-safe result.
+# The app is pinned to dark mode (.streamlit/config.toml, theme.base="dark"),
+# so these are the palette's *dark*-surface steps, not the light ones --
+# using the light steps here would fail the same contrast validation the
+# palette was built to pass, just against the wrong background.
 SERIES = {
-    "blue": "#2a78d6", "orange": "#eb6834", "aqua": "#1baf7a",
-    "yellow": "#eda100", "magenta": "#e87ba4", "green": "#008300",
-    "violet": "#4a3aa7", "red": "#e34948",
+    "blue": "#3987e5", "orange": "#d95926", "aqua": "#199e70",
+    "yellow": "#c98500", "magenta": "#d55181", "green": "#008300",
+    "violet": "#9085e9", "red": "#e66767",
 }
 CLASS_COLORS = {
     "hydraulic_pump": SERIES["blue"], "actuator": SERIES["orange"],
@@ -48,12 +52,18 @@ CLASS_COLORS = {
 }
 STATUS = {"good": "#0ca30c", "warning": "#fab219", "serious": "#ec835a", "critical": "#d03b3b"}
 MUTED = "#898781"
-GRID = "#e1e0d9"
+GRID = "#2c2c2a"
+INK = "#fafafa"
 
+# template="plotly_dark" and transparent plot/paper backgrounds together are
+# what make each chart blend into Streamlit's dark chrome instead of showing
+# as a bright white card -- template alone still paints its own dark
+# background, and transparent backgrounds alone would keep plotly_white's
+# light gridlines/text, so both are needed at once.
 PLOTLY_LAYOUT = dict(
-    template="plotly_white",
-    font=dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color="#0b0b0b"),
-    plot_bgcolor="#fcfcfb", paper_bgcolor="#fcfcfb",
+    template="plotly_dark",
+    font=dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color=INK),
+    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
     margin=dict(l=40, r=20, t=40, b=40),
 )
 
@@ -253,7 +263,7 @@ def page_reliability_explorer():
         ))
         fig.add_trace(go.Scatter(
             x=x, y=pdf, name=f"Weibull fit (k={k:.2f}, λ={scale:.0f}h)",
-            line=dict(color="#0b0b0b", width=2),
+            line=dict(color=INK, width=2),
         ))
         fig.update_layout(
             **PLOTLY_LAYOUT, height=360,
