@@ -1,23 +1,27 @@
 """
 Synthetic data generator for the Aircraft Sustainment Analytics Platform.
 
-Simulates 3 years of fleet maintenance activity for 200 aircraft / ~2,000
-components across 5 component classes, and emits deliberately messy raw
-source files (events.csv, components.csv, aircraft.csv, flights.json,
-inventory.dat) that downstream ingest logic must clean up.
+This simulates 3 years of fleet maintenance activity for 200 aircraft /
+~2,000 components across 5 component classes, and emits deliberately messy
+raw source files (events.csv, components.csv, aircraft.csv, flights.json,
+inventory.dat), because downstream ingest logic needs real messiness to
+clean up rather than already-tidy data.
 
 Design notes:
-- Component wear is modeled as a Weibull renewal process in flight-hours.
-  Each renewal ("overhaul") resets the hours-since-overhaul clock, which is
-  what makes hours_since_overhaul a genuine leading indicator of failure risk
-  rather than a random label.
-- Repair duration is lognormal; the location parameter (mu) is shifted by
-  component degradation, base staffing, and parts availability so the >48h
-  tail has real structure instead of being pure noise.
+- Component wear is modeled as a Weibull renewal process in flight-hours,
+  because that is what makes hours_since_overhaul a genuine leading
+  indicator of failure risk rather than a random label: each renewal
+  ("overhaul") resets the hours-since-overhaul clock, so later events
+  carry a causally real signal.
+- Repair duration is lognormal, and the location parameter (mu) is shifted
+  by component degradation, base staffing, and parts availability, because
+  otherwise the >48h tail would be pure noise instead of having real
+  structure a model could learn from.
 - All "dirtiness" (missing values, mixed date formats, inconsistent base
   codes, impossible values, duplicate rows) is applied only to the raw
-  output representation, never to the internal clean simulation, so we can
-  verify the simulation is sound before corrupting it.
+  output representation, never to the internal clean simulation -- this is
+  done so the underlying simulation can be verified as sound before it gets
+  corrupted for realism.
 """
 
 from __future__ import annotations
@@ -43,7 +47,8 @@ N_EVENTS_TARGET = 50_000
 
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 
-# Bases: canonical code -> (display name, staffing level 0-1, messy aliases)
+# Each base carries messy aliases here because events.csv is generated from
+# these aliases -- ingest.py's base-code crosswalk exists due to this list.
 BASES = {
     "SD": {"name": "San Diego", "staffing": 0.90,
            "aliases": ["SD", "San Diego", "sd ", "SAN DIEGO"]},
@@ -62,8 +67,10 @@ BASE_CODES = list(BASES.keys())
 
 AIRCRAFT_MODELS = ["F/A-18E", "P-8A", "MH-60R", "E-2D"]
 
-# Component class specs: Weibull shape/scale (flight hours), count per
-# aircraft, and lognormal duration base params.
+# Each class has its own Weibull shape/scale, per-aircraft count, and
+# lognormal duration params, because a single shared shape wouldn't
+# distinguish wear-out items (hydraulic, gear) from near-random ones
+# (avionics) -- that distinction is what k varies here to produce.
 COMPONENT_CLASSES = {
     "hydraulic_pump": {"k": 2.5, "scale": 6000, "per_aircraft": 2,
                         "duration_sigma": 0.55, "inspection_interval": 600,
@@ -100,8 +107,9 @@ def generate_aircraft() -> pd.DataFrame:
     tails = [f"AC{1000 + i}" for i in range(N_AIRCRAFT)]
     base_codes = rng.choice(BASE_CODES, size=N_AIRCRAFT)
     models = rng.choice(AIRCRAFT_MODELS, size=N_AIRCRAFT)
-    # entered service between 5 years before window start and window start,
-    # so components can have accumulated meaningful hours before year 1
+    # entered_service_date is set 5 years to 0 years before window start,
+    # because without that lead time components would all start at hour
+    # zero on day one of the window and year 1 would show no wear yet
     entered_service = WINDOW_START - pd.to_timedelta(
         rng.integers(200, 1800, size=N_AIRCRAFT), unit="D"
     )
@@ -123,8 +131,9 @@ def generate_components(aircraft_df: pd.DataFrame) -> pd.DataFrame:
         for cls, spec in COMPONENT_CLASSES.items():
             for _ in range(spec["per_aircraft"]):
                 comp_seq += 1
-                # install date: same as aircraft entry, with small jitter
-                # for components that were swapped in pre-window
+                # install_date gets a small jitter off the aircraft's entry
+                # date because real components on one airframe aren't all
+                # installed on the exact same day (some were swapped in)
                 install_date = ac["entered_service_date"] + pd.to_timedelta(
                     int(rng.integers(0, 60)), unit="D"
                 )
@@ -146,9 +155,11 @@ def _months_between(start: pd.Timestamp, end: pd.Timestamp) -> float:
 
 
 def _component_renewal_points(comp, rate: float, spec: dict) -> list[dict]:
-    """Weibull renewal process: each point is a real overhaul-triggering
-    failure ("Unscheduled" event) that resets the hours-since-overhaul
-    clock. Returns points within the observation window."""
+    """This returns Weibull renewal points, each a real overhaul-triggering
+    failure ("Unscheduled" event), because that renewal is what resets the
+    hours-since-overhaul clock -- only points inside the observation window
+    are returned, since anything after WINDOW_END hasn't happened yet from
+    the dataset's point of view."""
     points = []
     t = comp.install_date
     cumulative_hours = 0.0
@@ -170,8 +181,9 @@ def _component_renewal_points(comp, rate: float, spec: dict) -> list[dict]:
 
 def _periodic_events_in_segment(comp, rate: float, seg_start_date, seg_start_age: float,
                                  seg_length_hours: float, interval_hours: float) -> list[dict]:
-    """Fixed-interval events (formal scheduled inspections) within one
-    inter-overhaul segment."""
+    """These are fixed-interval formal scheduled inspections within one
+    inter-overhaul segment -- they're segment-scoped because an inspection
+    schedule restarts relative to the last overhaul, not the calendar."""
     events = []
     t_hours = interval_hours * rng.uniform(0.5, 1.0)
     while t_hours < seg_length_hours:
@@ -187,8 +199,10 @@ def _periodic_events_in_segment(comp, rate: float, seg_start_date, seg_start_age
 
 def _routine_events_in_segment(comp, rate: float, seg_start_date, seg_start_age: float,
                                 seg_length_hours: float, hourly_rate: float) -> list[dict]:
-    """Poisson process of minor write-ups/discrepancies -- the volume driver
-    of the log, in contrast to the rare, high-signal Unscheduled overhauls."""
+    """This models minor write-ups/discrepancies as a Poisson process
+    because that's what makes them the volume driver of the log -- most
+    real maintenance tickets are exactly this kind of frequent, low-stakes
+    entry, in contrast to the rare, high-signal Unscheduled overhauls."""
     events = []
     t_hours = rng.exponential(1.0 / hourly_rate)
     while t_hours < seg_length_hours:
@@ -204,10 +218,12 @@ def _routine_events_in_segment(comp, rate: float, seg_start_date, seg_start_age:
 
 def build_event_pool(components_df: pd.DataFrame,
                       aircraft_df: pd.DataFrame) -> pd.DataFrame:
-    """Per-component simulation built around overhaul segments, so that
-    hours_since_overhaul is consistent across all three event types:
-    Unscheduled (segment-ending overhaul), Scheduled (fixed-interval
-    inspection), and Routine (Poisson-process minor write-ups)."""
+    """This simulation is built around per-component overhaul segments,
+    because that structure is what keeps hours_since_overhaul consistent
+    across all three event types -- Unscheduled (segment-ending overhaul),
+    Scheduled (fixed-interval inspection), and Routine (Poisson-process
+    minor write-ups) -- rather than each event type computing it
+    independently and disagreeing with the others."""
     ac_rate = aircraft_df.set_index("aircraft_tail")["monthly_flight_hours"]
     events = []
 
@@ -272,28 +288,35 @@ def apply_seasonal_thinning(pool: pd.DataFrame, target_n: int) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 def _calibrate_mu(sigma: float, target_p_over_48: float = 0.085) -> float:
-    """Solve mu for lognormal(mu, sigma) s.t. P(X > 48) = target_p_over_48."""
+    """This solves for mu given sigma, because we need P(X > 48) to land on
+    target_p_over_48 exactly rather than falling out wherever mu happens to
+    be picked."""
     from scipy.stats import norm
     z = norm.ppf(1 - target_p_over_48)
     return np.log(48) - z * sigma
 
 
-# Covariate coefficients and base >48h tail rate by event_type. Unscheduled
-# repairs (genuine component failures) are the population most exposed to
-# degradation/staffing/parts effects; Routine write-ups are usually quick but
-# still occasionally escalate; Scheduled inspections use a separate short
-# fixed distribution below and don't go through this covariate model at all.
-# hours/staffing coefficients are deliberately strong -- these map directly to
-# allowed model features (hours_since_overhaul, base) -- while parts_backorder
-# stays a real but *unobservable* confounder (not an allowed feature), so the
-# trained model has genuine signal without being perfectly separable.
+# Unscheduled repairs get the highest exposure to these covariates because
+# they represent genuine component failures, which is where degradation,
+# staffing, and parts effects should bite hardest. Routine write-ups get a
+# smaller but still real exposure, because most are quick but some do
+# escalate. Scheduled inspections don't go through this model at all --
+# they use a separate short fixed distribution below -- because a formal
+# inspection is procedurally bounded and doesn't degrade the way a repair
+# does.
+# The hours/staffing coefficients are deliberately strong because they map
+# directly to allowed model features (hours_since_overhaul, base), whereas
+# parts_backorder is kept as a real but *unobservable* confounder (it's not
+# an allowed feature) specifically so the trained model ends up with
+# genuine signal without becoming perfectly separable.
 DURATION_MODEL = {
     "Unscheduled": {"hours": 1.1, "staffing": 0.7, "backorder": 0.5, "target": 0.30},
     "Routine": {"hours": 0.85, "staffing": 0.55, "backorder": 0.3, "target": 0.0885},
 }
 
-# Per-class multiplier on the Routine/Unscheduled base tail rate, giving
-# component_class its own genuine (not just sigma-driven) predictive signal.
+# This multiplier exists because, without it, component_class would only
+# affect duration through sigma -- adding a per-class tail-rate multiplier
+# gives component_class its own genuine predictive signal instead.
 CLASS_TAIL_MULTIPLIER = {
     "hydraulic_pump": 0.9, "actuator": 1.0, "avionics_module": 0.7,
     "landing_gear": 1.3, "environmental_control": 1.1,
@@ -332,12 +355,15 @@ def assign_duration_and_context(events_df: pd.DataFrame,
                 continue
             class_target = coefs["target"] * CLASS_TAIL_MULTIPLIER[cls]
             mu0 = _calibrate_mu(spec["duration_sigma"], class_target)
-            # recenter so the group's *average* covariate shift lands the
-            # group at its target tail rate, while per-row shifts still vary
+            # This recenters mu around the group's *average* covariate
+            # shift, because that's what lands the group at its target
+            # tail rate on average while still letting per-row shifts vary
             mu_row = mu0 - s[m].mean() + s[m]
             duration_hours[m] = rng.lognormal(mean=mu_row, sigma=sigma_arr[m])
 
-    # formal scheduled inspections: short, predictable, minimal tail
+    # Scheduled inspections are overwritten with a short fixed distribution
+    # here because they're procedurally bounded work, not open-ended
+    # troubleshooting, so their duration should be short and predictable
     scheduled_mask = (df["event_type"] == "Scheduled").to_numpy()
     duration_hours[scheduled_mask] = rng.lognormal(
         mean=np.log(4.0), sigma=0.5, size=scheduled_mask.sum()
@@ -349,7 +375,9 @@ def assign_duration_and_context(events_df: pd.DataFrame,
 
 def assign_priority(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # priority correlates loosely with event_type and class criticality
+    # p_aog/p_priority are keyed by event_type because a real failure
+    # ("Unscheduled") is far more likely to get flagged urgent than a
+    # routine write-up or a scheduled inspection, due to actual grounding risk
     p_aog = df["event_type"].map({"Unscheduled": 0.18, "Routine": 0.06, "Scheduled": 0.01}).to_numpy()
     p_priority = df["event_type"].map({"Unscheduled": 0.35, "Routine": 0.22, "Scheduled": 0.10}).to_numpy()
     r = rng.random(len(df))
@@ -365,7 +393,9 @@ def assign_priority(df: pd.DataFrame) -> pd.DataFrame:
 def finalize_close_dates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["closed_at"] = df["opened_at"] + pd.to_timedelta(df["duration_hours"], unit="h")
-    # events whose close would fall after the observation window are still open
+    # closed_at is set to NaT here because, whenever the close date would
+    # fall after WINDOW_END, we haven't actually observed the closure yet
+    # -- the event is genuinely still open as of the end of the dataset
     still_open = df["closed_at"] > WINDOW_END
     df.loc[still_open, "closed_at"] = pd.NaT
     df["status"] = np.where(still_open, "Open", "Closed")
@@ -403,7 +433,10 @@ def generate_flight_hours(aircraft_df: pd.DataFrame) -> list[dict]:
             hours = max(0.0, ac.monthly_flight_hours * noise)
             records.append({
                 "aircraft_tail": ac.aircraft_tail,
-                "month_start": int(m.timestamp() * 1000),  # epoch millis
+                # this is epoch millis, not ISO, because that's the format
+                # a real flight-ops export system would emit, and ingest.py
+                # needs a genuinely different format to parse per source
+                "month_start": int(m.timestamp() * 1000),
                 "flight_hours": round(hours, 1),
             })
     return records
@@ -439,10 +472,12 @@ def dirty_events_for_output(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     n = len(out)
 
-    # duplicate rows (~1%): a late-arriving re-extract with a status/notes
-    # update and a later record_loaded_at, so "dedupe keeping latest" has a
-    # genuine timestamp to key off. Done first, on real Timestamps, so the
-    # bumped record_loaded_at flows through the date formatting below.
+    # These duplicates simulate a late-arriving re-extract with a
+    # status/notes update and a later record_loaded_at, because ingest's
+    # "dedupe keeping latest" logic needs a genuine timestamp to key off --
+    # without the bumped timestamp it would just be a coin-flip tie. This
+    # step runs first, on real Timestamps, because the bumped
+    # record_loaded_at has to flow through the date formatting below.
     dup_idx = rng.choice(out.index, size=int(n * 0.01), replace=False)
     dups = out.loc[dup_idx].copy()
     dups["notes"] = "Status updated on re-extract"
@@ -452,12 +487,16 @@ def dirty_events_for_output(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.concat([out, dups], ignore_index=True)
     n = len(out)
 
-    # ~2% missing values in non-critical fields
+    # This targets ~2% missingness, and only in non-critical fields,
+    # because real source systems have exactly this kind of sparse gap in
+    # optional fields, while key/critical fields stay populated
     for col in NON_CRITICAL_FIELDS:
         mask = rng.random(n) < 0.02
         out.loc[mask, col] = np.nan
 
-    # a few impossible values, injected on real Timestamps before formatting
+    # These impossible values are injected on real Timestamps, before
+    # formatting, because ingest.py's negative-hours and
+    # closed-before-opened rules need genuinely invalid data to catch
     n_bad = max(1, int(n * 0.003))
     neg_idx = rng.choice(out.index, size=n_bad // 2, replace=False)
     out.loc[neg_idx, "hours_since_overhaul"] = -out.loc[neg_idx, "hours_since_overhaul"].abs()
@@ -469,8 +508,10 @@ def dirty_events_for_output(df: pd.DataFrame) -> pd.DataFrame:
         - pd.to_timedelta(rng.integers(1, 6, size=len(bad_close_idx)), unit="h")
     )
 
-    # mixed date formats: split opened_at/closed_at/record_loaded_at across
-    # a few plausible source formats
+    # opened_at/closed_at/record_loaded_at get split across a few plausible
+    # source formats here, because a real dataset assembled from multiple
+    # source systems would show exactly this kind of format inconsistency,
+    # and ingest.py's mixed-format date parser exists due to this split
     def mixed_format(ts_series: pd.Series) -> pd.Series:
         fmt_choice = rng.integers(0, 3, size=len(ts_series))
         out_vals = []
@@ -489,7 +530,9 @@ def dirty_events_for_output(df: pd.DataFrame) -> pd.DataFrame:
     out["closed_at"] = mixed_format(out["closed_at"])
     out["record_loaded_at"] = mixed_format(out["record_loaded_at"])
 
-    # inconsistent base codes: swap canonical code for a random alias
+    # base_code gets swapped for a random alias here, because real source
+    # data rarely agrees on one spelling for the same base, and ingest.py's
+    # base-code crosswalk exists specifically due to this inconsistency
     def messy_base(code: str) -> str:
         return rng.choice(BASES[code]["aliases"])
 
@@ -499,8 +542,10 @@ def dirty_events_for_output(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def write_inventory_fixed_width(inv_df: pd.DataFrame, path: Path) -> None:
-    # base_code(10) snapshot_date(10, MM/DD/YYYY) part_category(24)
-    # qty_available(8) qty_backorder(8)
+    # These column widths (base_code 10, snapshot_date 10 MM/DD/YYYY,
+    # part_category 24, qty_available 8, qty_backorder 8) are fixed here
+    # because ingest.py's fixed-width parser reads by exact byte offset,
+    # so the writer and reader have to agree on this layout
     with open(path, "w") as f:
         for row in inv_df.itertuples():
             date_str = row.snapshot_date.strftime("%m/%d/%Y")
@@ -555,7 +600,8 @@ def main():
     print("Injecting dirtiness into events output...")
     dirty_events = dirty_events_for_output(events)
 
-    # --- write outputs ---
+    # outputs are written from here down, because everything above this
+    # point is pure simulation and needed to finish before anything hit disk
     aircraft_out = aircraft_df.copy()
     aircraft_out["entered_service_date"] = aircraft_out["entered_service_date"].dt.strftime("%Y-%m-%d")
     aircraft_out.to_csv(RAW_DIR / "aircraft.csv", index=False)

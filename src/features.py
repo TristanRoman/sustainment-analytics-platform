@@ -1,16 +1,19 @@
 """
 Shared feature engineering for train.py and score.py.
 
-Single source of truth for which columns become model inputs and how they're
-computed, so scoring can never silently drift from what the model was
-trained on. Only fields knowable at event-creation time are included here --
-nothing populated after the event resolves (duration_hours, closed_at,
-exceeds_48h are targets/outcomes, never features).
+This module is the single source of truth for which columns become model
+inputs and how they're computed, because that's what stops scoring from
+silently drifting away from what the model was trained on -- if train.py
+and score.py each computed features independently, a change to one could
+go unnoticed by the other. Only fields knowable at event-creation time are
+included here, since duration_hours, closed_at, and exceeds_48h are
+targets/outcomes that wouldn't exist yet at prediction time and would leak
+the answer if used as features.
 
-The actual numeric encoding (one-hot, scaling, etc.) lives inside the sklearn
-Pipeline saved by train.py, not here -- that pipeline is the artifact reused
-by score.py, which is a stronger anti-drift guarantee than re-implementing
-encoding logic in two places.
+The actual numeric encoding (one-hot, scaling, etc.) lives inside the
+sklearn Pipeline saved by train.py, not here, because that pipeline is the
+artifact reused unchanged by score.py -- a stronger anti-drift guarantee
+than re-implementing encoding logic in two places.
 """
 
 from __future__ import annotations
@@ -26,8 +29,10 @@ CATEGORICAL_FEATURES = ["component_class", "base_code", "aircraft_tail", "priori
 NUMERIC_FEATURES = ["component_age_hours", "hours_since_overhaul", "prior_event_count"]
 FEATURE_COLUMNS = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
-# Columns carried alongside the features for splitting/labeling/display but
-# that are never fed to the model.
+# These columns are kept separate from FEATURE_COLUMNS because they're
+# needed for splitting/labeling/display (e.g. opened_at for the time-aware
+# split, exceeds_48h as the label) but would leak the outcome or add noise
+# if fed to the model as inputs.
 CONTEXT_COLUMNS = ["event_id", "component_id", "opened_at", "status", "exceeds_48h", "event_type"]
 
 
@@ -57,10 +62,11 @@ JOIN dim_component c ON c.component_id = e.component_id
 
 
 def build_feature_frame(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
-    """Return one row per event with all model features plus context
-    columns. Includes both Closed and Open events -- callers decide how to
-    filter (train.py excludes Open from training; score.py scores exactly
-    the Open ones)."""
+    """This returns both Closed and Open events, rather than filtering
+    here, because train.py and score.py need different subsets (train.py
+    excludes Open due to having no ground truth yet; score.py scores
+    exactly the Open ones) -- pushing the filter into this shared function
+    would force one caller's needs onto the other."""
     own_conn = conn is None
     if own_conn:
         conn = sqlite3.connect(DB_PATH)

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "trained_at": "2026-08-12T02:17:46.112881+00:00",
+  "trained_at": "2026-08-12T04:51:39.886122+00:00",
   "selected_model": "logistic_regression",
   "data_window": {
     "train_start": "2023-08-11 00:21:54",

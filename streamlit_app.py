@@ -8,10 +8,12 @@ Three pages:
                           (median/P90), and per-class Weibull fits.
   3. Data Quality      -- quarantine counts by rule and field completeness.
 
-All paths are resolved relative to this file so the app works both locally
-and on Streamlit Community Cloud, where the working directory at launch
-isn't guaranteed and the filesystem is ephemeral (so the SQLite warehouse
-and model artifact must already be committed to the repo).
+All paths are resolved relative to this file, rather than the working
+directory, because Streamlit Community Cloud doesn't guarantee the launch
+directory matches the repo root -- a cwd-relative path would break there
+even though it works locally. The SQLite warehouse and model artifact are
+loaded as committed files, not regenerated at runtime, due to Cloud's
+filesystem being ephemeral.
 """
 
 from __future__ import annotations
@@ -31,7 +33,9 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "data" / "warehouse.db"
 METADATA_PATH = APP_DIR / "models" / "metadata.json"
 
-# dataviz reference palette (validated, colorblind-safe categorical order)
+# These hex values come from the dataviz skill's reference palette, because
+# it was already validated colorblind-safe in a fixed categorical order --
+# picking colors ad hoc here would risk an unvalidated, non-CVD-safe result
 SERIES = {
     "blue": "#2a78d6", "orange": "#eb6834", "aqua": "#1baf7a",
     "yellow": "#eda100", "magenta": "#e87ba4", "green": "#008300",

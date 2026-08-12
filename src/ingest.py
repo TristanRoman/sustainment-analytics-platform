@@ -1,13 +1,17 @@
 """
 Ingest raw source files into the SQLite star schema (data/warehouse.db).
 
-Pipeline per source: read -> coerce types (log failures) -> canonicalize
-categories -> validate business rules (quarantine violations) -> dedupe ->
-referential integrity check -> idempotent load.
+Each source goes through the same pipeline -- read -> coerce types (log
+failures) -> canonicalize categories -> validate business rules (quarantine
+violations) -> dedupe -> referential integrity check -> idempotent load --
+because a source-specific pipeline would let each file's cleanup logic
+drift independently and become inconsistent with the others.
 
-Idempotency: every load uses a fixed BATCH_ID and loads inside a single
-transaction as delete-then-insert, so re-running ingest on unchanged raw
-files reproduces exactly the same warehouse state.
+Every load uses a fixed BATCH_ID and loads inside a single transaction as
+delete-then-insert. This is done because a timestamp-based batch id would
+accumulate a new batch on every run instead of overwriting the old one, so
+BATCH_ID has to be constant for re-running ingest on unchanged raw files to
+reproduce exactly the same warehouse state.
 """
 
 from __future__ import annotations
@@ -24,7 +28,9 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "warehouse.db"
 
 BATCH_ID = "full_history_load"
 
-# Canonical base reference data (crosswalk from messy source aliases).
+# This crosswalk exists because events.csv carries messy base-code aliases
+# ("SD" / "San Diego" / "sd") due to generator.py's dirtiness injection, so
+# something has to map them back to one canonical code before loading.
 BASE_ALIASES = {
     "sd": "SD", "san diego": "SD",
     "norva": "NORVA", "norfolk": "NORVA", "norfolk va": "NORVA",
@@ -58,7 +64,10 @@ DATE_FORMATS = [
 # --------------------------------------------------------------------------
 
 class RunLog:
-    """Collects quarantine rows and stage row-counts for one ingest run."""
+    """This class exists because quarantine rows and stage row-counts need
+    to be accumulated across every source in one run and then written
+    together at the end, rather than each ingest_* function writing to the
+    database piecemeal as it goes."""
 
     def __init__(self, batch_id: str):
         self.batch_id = batch_id
@@ -444,7 +453,10 @@ def ingest_events(conn: sqlite3.Connection, log: RunLog, valid_tails: set[str], 
     if df.empty:
         return
 
-    # dedupe on event_id, keep the row with the latest record_loaded_at
+    # This dedupes on event_id, keeping the row with the latest
+    # record_loaded_at, because generator.py injects ~1% duplicate rows
+    # with a later record_loaded_at on the re-extract copy, so "latest"
+    # is the one genuine signal available to decide which row to keep
     n_before_dedupe = len(df)
     df = df.sort_values("record_loaded_at").drop_duplicates(subset="event_id", keep="last")
     log.stage("fact_maintenance_events", "dedupe", n_before_dedupe, len(df))
@@ -490,7 +502,10 @@ def ingest_flight_hours(conn: sqlite3.Connection, log: RunLog, valid_tails: set[
 
 
 def parse_inventory_fixed_width(path: Path) -> list[dict]:
-    # base_code(10) snapshot_date(10, MM/DD/YYYY) part_category(24) qty_available(8) qty_backorder(8)
+    # These byte offsets (base_code 10, snapshot_date 10 MM/DD/YYYY,
+    # part_category 24, qty_available 8, qty_backorder 8) are hardcoded
+    # here because generator.py's write_inventory_fixed_width() writes
+    # exactly this layout, so the two have to stay in lockstep
     rows = []
     with open(path) as f:
         for line in f:
@@ -545,7 +560,12 @@ def ingest_inventory(conn: sqlite3.Connection, log: RunLog):
 def main():
     log = RunLog(BATCH_ID)
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = OFF")  # SQLite FK checks off during load order; enforced by app logic
+    # This is set explicitly, even though SQLite defaults to it, because
+    # dims and facts load in a specific order below and turning FK
+    # enforcement on would break on the dim_component -> dim_aircraft
+    # ordering; referential integrity is instead enforced in application
+    # code (the orphan_*_reference quarantine rules) due to that ordering
+    conn.execute("PRAGMA foreign_keys = OFF")
     init_schema(conn)
 
     print("Ingesting dim_aircraft...")
@@ -563,7 +583,9 @@ def main():
     print("Ingesting fact_inventory_snapshot...")
     ingest_inventory(conn, log)
 
-    # persist quarantine + metrics
+    # quarantine and metrics are written here, all at once, because they
+    # were only accumulated in-memory by RunLog during the per-source
+    # ingest calls above and need one final flush to the database
     with conn:
         conn.execute("DELETE FROM quarantine WHERE batch_id = ?", (BATCH_ID,))
         if log.quarantine_rows:

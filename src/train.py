@@ -1,27 +1,29 @@
 """
 Train the "event exceeds 48 hours" classifier.
 
-Time-aware split: the first 2 years of the observation window are train,
-the final year is held out for evaluation -- no random shuffling, since a
-random split would leak future maintenance patterns into training and
-overstate performance versus how the model will actually be used (predict
-forward on events not yet seen).
+The split is time-aware -- the first 2 years of the observation window are
+train, the final year is held out -- because a random split would leak
+future maintenance patterns into training and overstate performance,
+due to the model actually being used to predict forward on events it
+hasn't seen, not to interpolate between events it has.
 
-Only Closed events have a known outcome, so training and evaluation both
-exclude Open events (they are scored later, by score.py, not evaluated
-here -- there is no ground truth for them yet). A reopened event's clock
-still starts at its original creation time, so it sits wherever that
-creation date falls in the split; we don't create a second observation for
-the reopen itself.
+Training and evaluation both exclude Open events, because only Closed
+events have a known outcome -- Open events have no ground truth yet, which
+is exactly why they're scored later by score.py instead of evaluated here.
+A reopened event's clock still starts at its original creation time, so it
+sits wherever that creation date falls in the split; a second observation
+isn't created for the reopen itself, since the outcome being predicted is
+tied to the original ticket, not the reopen event.
 
-Two models are trained on identical inputs (via features.py) so the
-comparison is apples-to-apples:
+Two models are trained on identical inputs (via features.py), because that
+identical-inputs guarantee is what makes the comparison apples-to-apples:
   - Logistic regression baseline (one-hot + scaling via ColumnTransformer)
   - HistGradientBoostingClassifier (native pandas categorical support)
 
-The better model by PR-AUC on the held-out year is saved as models/model.pkl
-along with models/metadata.json describing training window, features, and
-metrics for both candidates.
+The better model by PR-AUC on the held-out year gets saved as
+models/model.pkl, along with models/metadata.json, because a future reader
+(or score.py) needs to know which model won and why without re-running
+training.
 """
 
 from __future__ import annotations
@@ -48,7 +50,10 @@ from features import CATEGORICAL_FEATURES, NUMERIC_FEATURES, FEATURE_COLUMNS, bu
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "warehouse.db"
 
-TOP_DECILE = 0.10  # planner capacity: flag the top 10% of scored events
+# This is 0.10 because planner capacity was specified as flagging the top
+# 10% of open events -- it's a named constant rather than a literal so
+# evaluate() and the metadata write below both stay in sync with it
+TOP_DECILE = 0.10
 
 
 def time_aware_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
@@ -71,9 +76,10 @@ def build_lr_pipeline() -> Pipeline:
 
 
 def build_gbm_pipeline() -> Pipeline:
-    # HistGradientBoostingClassifier reads pandas "category" dtype columns
-    # natively -- no manual encoding needed, so the raw feature frame from
-    # features.py can be passed straight through.
+    # No ColumnTransformer is built here, because HistGradientBoostingClassifier
+    # reads pandas "category" dtype columns natively -- due to that support,
+    # the raw feature frame from features.py can be passed straight through
+    # without any manual encoding step.
     clf = HistGradientBoostingClassifier(
         categorical_features="from_dtype",
         random_state=42,
